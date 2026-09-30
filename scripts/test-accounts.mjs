@@ -2426,6 +2426,35 @@ console.log("snapshot -> " + snapshot.status);
 }
 
 {
+	// Command Code: a route authored in a profile patch layer reaches the plugin
+	// through the llm registry, which states the id and nothing else — no
+	// apiKeyEnv. The adapter's own credential ref must still be resolved, or the
+	// card reports "not configured" with no ref to name and never queries.
+	const spec = resolveAccountSpec({ id: "commandcode", displayName: "commandcode", baseURL: "https://api.commandcode.ai/provider/v1" }, validateAccountConfig());
+	assert.equal(spec.adapter, "commandcode-goat", "the route id still selects the adapter");
+	assert.equal(spec.apiKeyRef, "COMMANDCODE_API_KEY", "the adapter supplies the ref the route cannot state");
+	const calls = [];
+	const account = await queryAccount(spec, credentials({ COMMANDCODE_API_KEY: "user_x" }), {
+		now: () => now,
+		fetch: async (url) => {
+			calls.push(String(url));
+			if (String(url).endsWith("/alpha/billing/credits")) return jsonResponse({ credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 }, windowLimits: { limited: true, fiveHour: { used: 1, cap: 10 } } });
+			return jsonResponse({}, 500);
+		}
+	});
+	assert.equal(account.status, "ok");
+	assert.equal(calls[0], "https://api.commandcode.ai/alpha/billing/credits", "the stored credential must authorize the credits query");
+	assert.equal(account.balance.remaining, 10);
+	const missing = await queryAccount(spec, credentials({}), {
+		now: () => now,
+		fetch: async () => { throw new Error("must not fetch without a credential"); }
+	});
+	assert.equal(missing.status, "not-configured");
+	assert.deepEqual(missing.missingCredentials, ["COMMANDCODE_API_KEY"], "the named ref is what the card tells the user to configure");
+	console.log("Command Code route without a profile credential ref ok");
+}
+
+{
 	// Command Code: the family placeholder keeps the account reachable on an
 	// install that never configured a route, while a real route wins over it.
 	const service = createAccountService({
@@ -2452,6 +2481,36 @@ console.log("snapshot -> " + snapshot.status);
 	const configuredViews = await configuredService.providerViews();
 	assert.deepEqual(configuredViews.filter((view) => view.adapter === "commandcode-goat").map((view) => view.id), ["commandcode-goat-autosync"]);
 	console.log("Command Code placeholder provider policy ok");
+}
+
+{
+	// Command Code on DSH 0.2 Desktop: the route arrives from the llm registry
+	// with an id and nothing else, while the credential is already stored. The
+	// card must be selectable and must query, not sit at "not configured".
+	const service = createAccountService({
+		credentials: credentials({ COMMANDCODE_API_KEY: "user_x" }),
+		getProviders: async () => [
+			{ id: "deepseek-official", displayName: "DeepSeek", apiKeyEnv: "DEEPSEEK_API_KEY", baseURL: "https://api.deepseek.com" },
+			{ id: "commandcode", displayName: "commandcode", pricingRelevant: false }
+		],
+		config: validateAccountConfig(),
+		deps: {
+			includeLegacyProviders: true,
+			now: () => now,
+			fetch: async (url) => {
+				if (String(url).endsWith("/alpha/billing/credits")) return jsonResponse({ credits: { monthlyCredits: 20, purchasedCredits: 0, freeCredits: 0 }, windowLimits: { limited: true, fiveHour: { used: 2, cap: 20 } } });
+				return jsonResponse({}, 500);
+			}
+		}
+	});
+	const view = (await service.providerViews()).find((entry) => entry.id === "commandcode");
+	assert.equal(view?.adapter, "commandcode-goat");
+	assert.equal(view?.configured, true, "a stored adapter credential makes the registry route usable");
+	const account = await service.get("commandcode", { force: true });
+	assert.equal(account.status, "ok");
+	assert.equal(account.balance.remaining, 20);
+	assert.equal(JSON.stringify(account).includes("user_x"), false, "API key must never cross the account snapshot boundary");
+	console.log("Command Code registry route uses its stored credential ok");
 }
 
 console.log("ACCOUNT TESTS PASSED");
